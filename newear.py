@@ -12,86 +12,89 @@ import torch.utils.data
 from torch.distributions.negative_binomial import NegativeBinomial
 
 WSZ = 100000
-#MSZ = 1698
-MSZ = 1203
 
 class XData(torch.utils.data.Dataset):
 
-   def __init__(self, path, device='cpu'):
+   def __init__(self, path, device='auto'):
 
       super(XData, self).__init__()
 
-      self.data = torch.zeros((MSZ,MSZ), device=device)
+      # Use graphics card whenever possible.
+      self.device = device if device != 'auto' else \
+         'cuda' if torch.cuda.is_available() else 'cpu'
+
+      # Store contacts in set 'S' to determine
+      # the size 'sz' of the Hi-C contact matrix.
+      S = set()
+      sz = 0
       with gzip.open(path) as f:
          for line in f:
             (a,b,c) = (int(_) for _ in line.split())
-            self.data[a/WSZ-1,b/WSZ-1] = c
+            S.add((a,b,c))
+            if a > sz: sz = a
+            if b > sz: sz = b
+
+      # Write Hi-C matrix as 'pytorch' tensor.
+      self.sz = sz / WSZ
+      self.data = torch.zeros((self.sz,self.sz), device=self.device)
+      for (a,b,c) in S:
+         self.data[a/WSZ-1,b/WSZ-1] = c
 
 
 class Model(nn.Module):
 
-   def __init__(self):
-
+   def __init__(self, HiC):
       super(Model, self).__init__()
-
-      self.A = nn.Parameter(torch.ones(1))
-      self.B = nn.Parameter(torch.ones(1))
-      self.p = nn.Parameter(torch.ones(MSZ))
-      #self.s = nn.Parameter(torch.ones(MSZ))
-      self.l = nn.Parameter(torch.ones(1))
-      self.t = nn.Parameter(torch.ones(1))
-      # Mask half of the matrix, plus the diagonal.
-      self.mask = torch.ones((MSZ,MSZ)).triu(1)
-      if os.path.isfile('dmat.tch'):
-         with open('dmat.tch') as f:
-            self.dmat = torch.load(f)
-      else:
-         self.dmat = torch.zeros((MSZ,MSZ))
-         for i in range(MSZ):
-            for j in range(i, MSZ):
-               self.dmat[i,j] = j-i+1
-         with open('dmat.tch', 'w') as f:
-            torch.save(self.dmat, f)
+      # Data.
+      self.HiC = HiC
+      self.sz = HiC.sz
+      self.device = HiC.device
+      # Parameters.
+      self.p = nn.Parameter(torch.ones(self.sz, device=self.device))
+      self.b = nn.Parameter(torch.ones(1, device=self.device))
+      self.a = nn.Parameter(torch.ones(1, device=self.device))
+      self.t = nn.Parameter(torch.ones(1, device=self.device))
 
 
-   def optimize(self, path):
-      # Move to proper device.
-      self.dmat = self.dmat.to(device=self.A.device)
-      self.mask = self.mask.to(device=self.A.device)
-      HiC = XData(path, device=self.A.device)
-      # Weed out.
-      out = torch.sum(HiC.data, 1) < 1
+   def optimize(self):
+      # Mask the diagonal (dominant outlier) and half of
+      # the matrix to not double-count the evidence.
+      mask = torch.ones((self.sz,self.sz), device=self.device).triu(1)
+      # Compute log-distances between loci.
+      u = torch.ones((self.sz,self.sz), device=self.device).triu()
+      dmat = torch.matrix_power(u, 2)
+      dmat[dmat == 0] = 1.0
+      dmat = torch.log(dmat)
+      # Optimizer and scheduler.
       optim = torch.optim.Adam(self.parameters(), lr=.01)
       sched = torch.optim.lr_scheduler.MultiStepLR(optim,
             milestones=[3000])
-      # Take log distance.
-      self.dmat[self.dmat == 0] = 1.0
-      self.dmat = torch.log(self.dmat)
-      s = torch.sqrt(torch.sum(HiC.data, 1))
-      SS = torch.ger(s,s)
+      # Weights (mappability biases etc.)
+      w = torch.sqrt(torch.sum(self.HiC.data, 1))
+      W = torch.ger(w,w)
       for step in range(3200):
-         # Take the sigmoid to constraint 'P' within (0,1).
+         # Take the sigmoid to constrain 'P' within (0,1).
          P = torch.sigmoid(self.p)
-         x = P*self.A - (1-P)*self.A
+         x = P*self.b - (1-P)*self.b
          AB = torch.ger(x,x)
          # Expected counts.
-         mu = SS * torch.exp(AB - self.dmat*self.l)
+         mu = W * torch.exp(AB - dmat*self.a)
          # Reparametrize for the negative binoimal.
          nbp = mu / (mu + self.t)
-         log_p = NegativeBinomial(self.t, nbp).log_prob(HiC.data)
-         ll = -torch.sum(log_p * self.mask)
+         log_p = NegativeBinomial(self.t, nbp).log_prob(self.HiC.data)
+         # Multiply by mask to remove entries.
+         ll = -torch.sum(log_p * mask)
          optim.zero_grad()
          ll.backward()
          optim.step()
          sched.step()
          sys.stderr.write('%d %f\n' % (step, float(ll)))
          
-      print '# A', float(self.A)
-      print '# B', float(self.B)
-      print '# l', float(self.l)
-      print '# t', float(self.t)
-      for i in range(MSZ):
-         print i, float(torch.sigmoid(self.p[i])), float(out[i])
+      print '# alpha', float(self.a)
+      print '# beta', float(self.b)
+      print '# theta', float(self.t)
+      for i in range(self.sz):
+         print i, float(torch.sigmoid(self.p[i]))
 
-M = Model().cuda() if torch.cuda.is_available() else Model()
-M.optimize(sys.argv[1])
+M = Model(XData(sys.argv[1]))
+M.optimize()
